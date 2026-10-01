@@ -108,7 +108,7 @@ def run_query(
     user_input: str,
     db_url: str,
     api_key: str,
-    model: str = "openai/gpt-oss-120b",
+    model: str = os.getenv("LLM_MODEL_GROQ", "openai/gpt-oss-120b"),
     base_url: str = "https://api.groq.com/openai/v1",
     history: list = []
 ) -> dict:

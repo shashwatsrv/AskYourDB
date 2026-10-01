@@ -29,3 +29,6 @@ Thumbs.db
 
 # Project specific
 *.sql
+
+#secrets
+.streamlit/secrets.toml

@@ -30,25 +30,55 @@ with st.sidebar:
             type="password"
         )
     else:
-        uploaded = st.file_uploader("Upload file", type=["csv", "xlsx"],
-                                     help="Max 10MB")
+        uploaded = st.file_uploader(
+            "Upload file",
+            type=["csv", "xlsx"],
+            help="Max 10MB"
+        )
         if uploaded:
             if uploaded.size > 10 * 1024 * 1024:
                 st.error("File exceeds 10MB limit.")
                 st.stop()
+
             from app.core import load_file_to_sqlite
             db_url, table_name = load_file_to_sqlite(uploaded)
             st.success(f"Loaded table: `{table_name}`")
 
     st.divider()
     st.header("LLM")
-    mode = st.radio("Inference mode", ["Cloud (Groq)", "Local (Ollama)"], index=0)
+    mode = st.radio(
+        "Inference mode",
+        ["Cloud (Groq)", "Local (Ollama)"],
+        index=0
+    )
 
     if mode == "Cloud (Groq)":
-        api_key = st.text_input("Groq API key", type="password",
-                                 value=os.getenv("GROQ_API_KEY", ""))
+        # Read Groq API key from Streamlit secrets first,
+        # then fall back to environment variables.
+        default_key = ""
+        try:
+            default_key = st.secrets["LLM_API_KEY_GROQ"]
+        except:
+            default_key = os.getenv("LLM_API_KEY_GROQ", "")
+
+        api_key = st.text_input(
+            "Groq API key",
+            type="password",
+            value=default_key
+        )
+
         base_url = "https://api.groq.com/openai/v1"
-        model = "openai/gpt-oss-120b"
+
+        # Read Groq model from Streamlit secrets first,
+        # then fall back to environment variables.
+        try:
+            model = st.secrets["LLM_MODEL_GROQ"]
+        except:
+            model = os.getenv(
+                "LLM_MODEL_GROQ",
+                "openai/gpt-oss-120b"
+            )
+
     else:
         api_key = "ollama"
         base_url = "http://localhost:11434/v1"
@@ -58,39 +88,61 @@ with st.sidebar:
     st.divider()
     st.header("Session")
     st.caption(f"ID: {st.session_state.session_id[:8]}...")
+
     if st.button("New conversation"):
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.session_state.history = []
         st.rerun()
-        
+
+
 # --- Validate connection ---
 if not db_url:
-    st.info("👈 Enter your Postgres connection string in the sidebar to get started.")
+    st.info(
+        "👈 Enter your Postgres connection string in the sidebar to get started."
+    )
     st.stop()
 
 if not api_key or api_key == "":
     st.warning("Enter your API key in the sidebar.")
     st.stop()
 
+
 # --- Chat history ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
+
         if msg.get("sql"):
             with st.expander("Generated SQL"):
                 st.code(msg["sql"], language="sql")
+
         if msg.get("rows"):
             with st.expander("Results"):
-                st.dataframe(pd.DataFrame(msg["rows"], columns=msg.get("columns")))
+                st.dataframe(
+                    pd.DataFrame(
+                        msg["rows"],
+                        columns=msg.get("columns")
+                    )
+                )
+
         if msg.get("confidence") is not None:
-            st.caption(f"Confidence: {msg['confidence']} · Intent: {msg.get('intent')}")
+            st.caption(
+                f"Confidence: {msg['confidence']} · "
+                f"Intent: {msg.get('intent')}"
+            )
+
         if msg.get("warning"):
             st.warning(msg["warning"])
 
+
 # --- Input ---
 if prompt := st.chat_input("Ask a question about your data..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages.append({
+        "role": "user",
+        "content": prompt
+    })
+
     with st.chat_message("user"):
         st.write(prompt)
 
@@ -108,36 +160,67 @@ if prompt := st.chat_input("Ask a question about your data..."):
 
                 if output.get("error"):
                     st.error(f"Error: {output['error']}")
+
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": f"Error: {output['error']}"
                     })
+
                 else:
                     st.write("Query executed successfully.")
-                    with st.expander("Generated SQL", expanded=True):
-                        st.code(output["sql"], language="sql")
+
+                    with st.expander(
+                        "Generated SQL",
+                        expanded=True
+                    ):
+                        st.code(
+                            output["sql"],
+                            language="sql"
+                        )
 
                     if output["rows"]:
-                        with st.expander("Results", expanded=True):
-                            st.dataframe(pd.DataFrame(
-                                output["rows"],
-                                columns=output.get("columns")
-                            ))
+                        with st.expander(
+                            "Results",
+                            expanded=True
+                        ):
+                            st.dataframe(
+                                pd.DataFrame(
+                                    output["rows"],
+                                    columns=output.get("columns")
+                                )
+                            )
                     else:
                         st.info("Query returned no results.")
 
-                    st.caption(f"Confidence: {output['confidence']} · Intent: {output['intent']}")
+                    st.caption(
+                        f"Confidence: {output['confidence']} · "
+                        f"Intent: {output['intent']}"
+                    )
+
                     if output.get("warning"):
                         st.warning(output["warning"])
 
                     # explain
-                    explanation = explain_sql(output["sql"], api_key, model, base_url)
+                    explanation = explain_sql(
+                        output["sql"],
+                        api_key,
+                        model,
+                        base_url
+                    )
+
                     if explanation:
                         st.info(f"💡 {explanation}")
 
                     # update session history
-                    st.session_state.history.append({"role": "user", "content": prompt})
-                    st.session_state.history.append({"role": "assistant", "content": output["sql"]})
+                    st.session_state.history.append({
+                        "role": "user",
+                        "content": prompt
+                    })
+
+                    st.session_state.history.append({
+                        "role": "assistant",
+                        "content": output["sql"]
+                    })
 
                     st.session_state.messages.append({
                         "role": "assistant",
