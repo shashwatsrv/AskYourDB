@@ -2,11 +2,19 @@ import streamlit as st
 import uuid
 import os
 import pandas as pd
-from app.core import run_query, explain_sql
+from app.core import run_query, explain_sql, load_file_to_sqlite
 
-st.set_page_config(page_title="NL SQL Engine", layout="wide")
+st.set_page_config(page_title="AskYourDB", layout="wide")
 st.title("AskYourDB")
-st.caption("Connect your Postgres database and query it in plain English")
+st.caption("Connect your Postgres database or upload a CSV/XLSX and query it in plain English")
+
+
+def get_secret(name: str, default: str = "") -> str:
+    """Read from Streamlit secrets first, then fall back to environment variables."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
 
 
 # --- Session state ---
@@ -26,6 +34,7 @@ with st.sidebar:
     if source == "Postgres":
         db_url = st.text_input(
             "Connection string",
+            value=get_secret("DEMO_DB_URL"),
             placeholder="postgresql://user:password@host:5432/dbname",
             type="password"
         )
@@ -39,46 +48,21 @@ with st.sidebar:
             if uploaded.size > 10 * 1024 * 1024:
                 st.error("File exceeds 10MB limit.")
                 st.stop()
-
-            from app.core import load_file_to_sqlite
             db_url, table_name = load_file_to_sqlite(uploaded)
             st.success(f"Loaded table: `{table_name}`")
 
     st.divider()
     st.header("LLM")
-    mode = st.radio(
-        "Inference mode",
-        ["Cloud (Groq)", "Local (Ollama)"],
-        index=0
-    )
+    mode = st.radio("Inference mode", ["Cloud (Groq)", "Local (Ollama)"], index=0)
 
     if mode == "Cloud (Groq)":
-        # Read Groq API key from Streamlit secrets first,
-        # then fall back to environment variables.
-        default_key = ""
-        try:
-            default_key = st.secrets["LLM_API_KEY_GROQ"]
-        except:
-            default_key = os.getenv("LLM_API_KEY_GROQ", "")
-
         api_key = st.text_input(
             "Groq API key",
             type="password",
-            value=default_key
+            value=get_secret("LLM_API_KEY_GROQ")
         )
-
         base_url = "https://api.groq.com/openai/v1"
-
-        # Read Groq model from Streamlit secrets first,
-        # then fall back to environment variables.
-        try:
-            model = st.secrets["LLM_MODEL_GROQ"]
-        except:
-            model = os.getenv(
-                "LLM_MODEL_GROQ",
-                "openai/gpt-oss-120b"
-            )
-
+        model = get_secret("LLM_MODEL_GROQ", "openai/gpt-oss-120b")
     else:
         api_key = "ollama"
         base_url = "http://localhost:11434/v1"
@@ -96,14 +80,15 @@ with st.sidebar:
         st.rerun()
 
 
-# --- Validate connection ---
+# --- Validate inputs ---
 if not db_url:
-    st.info(
-        "👈 Enter your Postgres connection string in the sidebar to get started."
-    )
+    if source == "Postgres":
+        st.info("👈 Enter your Postgres connection string in the sidebar to get started.")
+    else:
+        st.info("👈 Upload a CSV or XLSX file in the sidebar to get started.")
     st.stop()
 
-if not api_key or api_key == "":
+if not api_key:
     st.warning("Enter your API key in the sidebar.")
     st.stop()
 
@@ -119,18 +104,10 @@ for msg in st.session_state.messages:
 
         if msg.get("rows"):
             with st.expander("Results"):
-                st.dataframe(
-                    pd.DataFrame(
-                        msg["rows"],
-                        columns=msg.get("columns")
-                    )
-                )
+                st.dataframe(pd.DataFrame(msg["rows"], columns=msg.get("columns")))
 
         if msg.get("confidence") is not None:
-            st.caption(
-                f"Confidence: {msg['confidence']} · "
-                f"Intent: {msg.get('intent')}"
-            )
+            st.caption(f"Confidence: {msg['confidence']} · Intent: {msg.get('intent')}")
 
         if msg.get("warning"):
             st.warning(msg["warning"])
@@ -138,10 +115,7 @@ for msg in st.session_state.messages:
 
 # --- Input ---
 if prompt := st.chat_input("Ask a question about your data..."):
-    st.session_state.messages.append({
-        "role": "user",
-        "content": prompt
-    })
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("user"):
         st.write(prompt)
@@ -160,7 +134,6 @@ if prompt := st.chat_input("Ask a question about your data..."):
 
                 if output.get("error"):
                     st.error(f"Error: {output['error']}")
-
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": f"Error: {output['error']}"
@@ -169,58 +142,30 @@ if prompt := st.chat_input("Ask a question about your data..."):
                 else:
                     st.write("Query executed successfully.")
 
-                    with st.expander(
-                        "Generated SQL",
-                        expanded=True
-                    ):
-                        st.code(
-                            output["sql"],
-                            language="sql"
-                        )
+                    with st.expander("Generated SQL", expanded=True):
+                        st.code(output["sql"], language="sql")
 
                     if output["rows"]:
-                        with st.expander(
-                            "Results",
-                            expanded=True
-                        ):
+                        with st.expander("Results", expanded=True):
                             st.dataframe(
-                                pd.DataFrame(
-                                    output["rows"],
-                                    columns=output.get("columns")
-                                )
+                                pd.DataFrame(output["rows"], columns=output.get("columns"))
                             )
                     else:
                         st.info("Query returned no results.")
 
-                    st.caption(
-                        f"Confidence: {output['confidence']} · "
-                        f"Intent: {output['intent']}"
-                    )
+                    st.caption(f"Confidence: {output['confidence']} · Intent: {output['intent']}")
 
                     if output.get("warning"):
                         st.warning(output["warning"])
 
                     # explain
-                    explanation = explain_sql(
-                        output["sql"],
-                        api_key,
-                        model,
-                        base_url
-                    )
-
+                    explanation = explain_sql(output["sql"], api_key, model, base_url)
                     if explanation:
                         st.info(f"💡 {explanation}")
 
                     # update session history
-                    st.session_state.history.append({
-                        "role": "user",
-                        "content": prompt
-                    })
-
-                    st.session_state.history.append({
-                        "role": "assistant",
-                        "content": output["sql"]
-                    })
+                    st.session_state.history.append({"role": "user", "content": prompt})
+                    st.session_state.history.append({"role": "assistant", "content": output["sql"]})
 
                     st.session_state.messages.append({
                         "role": "assistant",
