@@ -32,12 +32,16 @@ with st.sidebar:
 
     db_url = None
     if source == "Postgres":
-        db_url = st.text_input(
+        # Defaults are never placed in the widget, so the eye icon only
+        # reveals what the visitor typed themselves.
+        user_db_url = st.text_input(
             "Connection string",
-            value=get_secret("DEMO_DB_URL"),
-            placeholder="postgresql://user:password@host:5432/dbname",
+            placeholder="Leave blank to use the demo database",
             type="password"
-        )
+        ).strip()
+        db_url = user_db_url or get_secret("DEMO_DB_URL")
+        if not user_db_url and db_url:
+            st.caption("Using the demo database (Northwind, read-only).")
     else:
         uploaded = st.file_uploader(
             "Upload file",
@@ -86,14 +90,10 @@ with st.sidebar:
 # --- Validate inputs ---
 if not db_url:
     if source == "Postgres":
-        user_db_url = st.text_input(
-            "Connection string",
-            placeholder="Leave blank to use the demo database",
-            type="password"
-        ).strip()
-        db_url = user_db_url or get_secret("DEMO_DB_URL")
-        if not user_db_url and db_url:
-            st.caption("Using the demo database (Northwind, read-only).")
+        st.info("👈 Enter your Postgres connection string in the sidebar to get started.")
+    else:
+        st.info("👈 Upload a CSV or XLSX file in the sidebar to get started.")
+    st.stop()
 
 if not api_key:
     st.warning("Enter your API key in the sidebar.")
