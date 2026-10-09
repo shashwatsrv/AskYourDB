@@ -33,6 +33,13 @@ def clean_sql(raw: str) -> str:
     raw = raw.replace("`", '"')
     return raw.strip()
 
+
+def extract_sql(raw: str) -> str:
+    raw = clean_sql(raw or "")
+    m = re.search(r"\b(SELECT|WITH)\b", raw, re.IGNORECASE)
+    return raw[m.start():].strip() if m else ""
+
+
 def query(user_input: str, session_id: str = "default", inference_mode: str = "ollama") -> dict:
     client, model = MODELS[inference_mode]
 
@@ -62,7 +69,8 @@ Use PostgreSQL syntax only. Quote table/column names with double quotes if neede
         model=model,
         messages=messages
     )
-    sql = clean_sql(response.choices[0].message.content)
+    raw = response.choices[0].message.content or ""
+    sql = extract_sql(raw)
     print(f"Generated SQL:\n{sql}\n")
 
     if not sql.strip().upper().startswith(("SELECT", "WITH", "EXPLAIN")):

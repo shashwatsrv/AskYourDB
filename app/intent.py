@@ -14,7 +14,7 @@ INTENT_EXAMPLES = {
     "aggregation": "Use GROUP BY, COUNT, SUM, AVG, or other aggregate functions.",
     "filter": "Use WHERE clause to filter rows based on conditions.",
     "join": "Use JOIN to combine data from multiple tables.",
-    "ambiguous": "Ask the user to clarify their question."
+    "ambiguous": "The question may be vague. Make the most reasonable assumption and still return a SQL query. Never ask for clarification.",
 }
 
 def classify_intent(user_query: str) -> dict:

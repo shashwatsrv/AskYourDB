@@ -22,7 +22,7 @@ INTENT_HINTS = {
     "aggregation": "Use GROUP BY, COUNT, SUM, AVG, or other aggregate functions.",
     "filter": "Use WHERE clause to filter rows based on conditions.",
     "join": "Use JOIN to combine data from multiple tables.",
-    "ambiguous": "Ask the user to clarify their question."
+    "ambiguous": "The question may be vague. Make the most reasonable assumption and still return a SQL query. Never ask for clarification.",
 }
 
 BLOCKED_OPS = {"DROP", "DELETE", "ALTER", "TRUNCATE", "INSERT", "UPDATE", "CREATE"}
@@ -103,6 +103,13 @@ def clean_sql(raw: str) -> str:
     raw = raw.replace("`", '"')
     return raw.strip()
 
+# --- Extract SQL ---
+def extract_sql(raw: str) -> str:
+    raw = clean_sql(raw or "")
+    m = re.search(r"\b(SELECT|WITH)\b", raw, re.IGNORECASE)
+    return raw[m.start():].strip() if m else ""
+
+
 # --- Main query function ---
 def run_query(
     user_input: str,
@@ -140,13 +147,14 @@ Use {dialect} syntax only. Return only the SQL query, nothing else."""}
 
     # LLM call
     response = client.chat.completions.create(model=model, messages=messages)
-    sql = clean_sql(response.choices[0].message.content)
+    raw = response.choices[0].message.content or ""
+    sql = extract_sql(raw)
 
     # guard
-    if not sql.strip().upper().startswith(("SELECT", "WITH", "EXPLAIN")):
+    if not sql:
         return {"sql": "", "rows": [], "intent": intent["intent"],
-                "confidence": 0.0, "error": "Could not generate SQL — try rephrasing."}
-
+                "confidence": 0.0,
+                "error": raw.strip()[:300] or "Could not generate SQL — try rephrasing."}
     # validate
     validation = validate_sql(sql, known_tables, dialect=dialect)
     if not validation["valid"]:
