@@ -56,11 +56,14 @@ with st.sidebar:
     mode = st.radio("Inference mode", ["Cloud (Groq)", "Local (Ollama)"], index=0)
 
     if mode == "Cloud (Groq)":
-        api_key = st.text_input(
+        user_api_key = st.text_input(
             "Groq API key",
             type="password",
-            value=get_secret("LLM_API_KEY_GROQ")
-        )
+            placeholder="Leave blank to use the demo key"
+        ).strip()
+        api_key = user_api_key or get_secret("LLM_API_KEY_GROQ")
+        if not user_api_key and api_key:
+            st.caption("Using the demo key.")
         base_url = "https://api.groq.com/openai/v1"
         model = get_secret("LLM_MODEL_GROQ", "openai/gpt-oss-120b")
     else:
@@ -83,10 +86,14 @@ with st.sidebar:
 # --- Validate inputs ---
 if not db_url:
     if source == "Postgres":
-        st.info("👈 Enter your Postgres connection string in the sidebar to get started.")
-    else:
-        st.info("👈 Upload a CSV or XLSX file in the sidebar to get started.")
-    st.stop()
+        user_db_url = st.text_input(
+            "Connection string",
+            placeholder="Leave blank to use the demo database",
+            type="password"
+        ).strip()
+        db_url = user_db_url or get_secret("DEMO_DB_URL")
+        if not user_db_url and db_url:
+            st.caption("Using the demo database (Northwind, read-only).")
 
 if not api_key:
     st.warning("Enter your API key in the sidebar.")
