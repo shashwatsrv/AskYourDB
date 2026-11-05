@@ -2,8 +2,10 @@ import streamlit as st
 import uuid
 import os
 import pandas as pd
-from app.core import run_query, explain_sql, load_file_to_sqlite
+from app.core import run_query, explain_sql, load_files_to_sqlite
 
+MAX_FILES = 5
+MAX_MB = 10
 st.set_page_config(page_title="AskYourDB", layout="wide")
 st.title("AskYourDB")
 st.caption("Connect your Postgres database or upload a CSV/XLSX and query it in plain English")
@@ -43,18 +45,37 @@ with st.sidebar:
         if not user_db_url and db_url:
             st.caption("Using the demo database (Northwind, read-only).")
     else:
-        uploaded = st.file_uploader(
-            "Upload file",
-            type=["csv", "xlsx"],
-            help="Max 10MB"
-        )
-        if uploaded:
-            if uploaded.size > 10 * 1024 * 1024:
-                st.error("File exceeds 10MB limit.")
-                st.stop()
-            db_url, table_name = load_file_to_sqlite(uploaded)
-            st.success(f"Loaded table: `{table_name}`")
 
+        uploaded_files = st.file_uploader(
+            "Upload files",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+            help=f"Up to {MAX_FILES} files, max {MAX_MB}MB each"
+        )
+        if uploaded_files:
+            if len(uploaded_files) > MAX_FILES:
+                st.error(f"Please upload at most {MAX_FILES} files.")
+                st.stop()
+            for f in uploaded_files:
+                if f.size > MAX_MB * 1024 * 1024:
+                    st.error(f"{f.name} exceeds the {MAX_MB}MB limit.")
+                    st.stop()
+
+            # Load once per distinct set of files, not on every rerun
+            sig = tuple((f.name, f.size) for f in uploaded_files)
+            if st.session_state.get("upload_sig") != sig:
+                with st.spinner("Loading files..."):
+                    url, tables = load_files_to_sqlite(uploaded_files)
+                st.session_state.upload_sig = sig
+                st.session_state.upload_db_url = url
+                st.session_state.upload_tables = tables
+                # data changed, so old conversation no longer applies
+                st.session_state.messages = []
+                st.session_state.history = []
+
+            db_url = st.session_state.upload_db_url
+            for t in st.session_state.upload_tables:
+                st.success(f"`{t['table']}` ({t['rows']} rows) from {t['source']}")
     st.divider()
     st.header("LLM")
     mode = st.radio("Inference mode", ["Cloud (Groq)", "Local (Ollama)"], index=0)
@@ -92,7 +113,7 @@ if not db_url:
     if source == "Postgres":
         st.info("👈 Enter your Postgres connection string in the sidebar to get started.")
     else:
-        st.info("👈 Upload a CSV or XLSX file in the sidebar to get started.")
+        st.info("👈 Upload one or more CSV/XLSX files in the sidebar to get started.")
     st.stop()
 
 if not api_key:

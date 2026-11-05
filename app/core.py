@@ -216,3 +216,54 @@ def load_file_to_sqlite(file) -> tuple[str, str]:
     return f"sqlite:///{tmp.name}", table_name
 
 
+# --- Multi-file loader (v2) ---
+def _clean_name(raw: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9_]", "_", str(raw).strip().lower())
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name or name[0].isdigit():
+        name = "t_" + name
+    return name
+
+
+def _unique(name: str, used: set) -> str:
+    base, i = name, 2
+    while name in used:
+        name = f"{base}_{i}"
+        i += 1
+    used.add(name)
+    return name
+
+
+def load_files_to_sqlite(files) -> tuple[str, list[dict]]:
+    """Load several CSV/XLSX files (every sheet) into ONE temp SQLite DB.
+    Returns (engine_url, tables), where tables is a list of
+    {"table": ..., "source": ..., "rows": ..., "columns": [...]}."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = sqlite3.connect(tmp.name)
+    used_tables: set = set()
+    tables: list[dict] = []
+
+    for f in files:
+        stem = f.name.rsplit(".", 1)[0]
+        if f.name.lower().endswith(".csv"):
+            sheets = {None: pd.read_csv(f)}
+        else:
+            sheets = pd.read_excel(f, sheet_name=None)  # all sheets
+
+        for sheet, df in sheets.items():
+            if df.shape[1] == 0:
+                continue  # skip empty sheets
+            label = stem if (sheet is None or len(sheets) == 1) else f"{stem}_{sheet}"
+            table = _unique(_clean_name(label), used_tables)
+
+            cols_used: set = set()
+            df.columns = [_unique(_clean_name(c), cols_used) for c in df.columns]
+
+            df.to_sql(table, conn, if_exists="replace", index=False)
+            source = f.name if sheet is None else f"{f.name} [{sheet}]"
+            tables.append({"table": table, "source": source,
+                           "rows": len(df), "columns": list(df.columns)})
+
+    conn.close()
+    return f"sqlite:///{tmp.name}", tables
