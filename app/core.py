@@ -25,7 +25,9 @@ INTENT_HINTS = {
     "ambiguous": "The question may be vague. Make the most reasonable assumption and still return a SQL query. Never ask for clarification.",
 }
 
-BLOCKED_OPS = {"DROP", "DELETE", "ALTER", "TRUNCATE", "INSERT", "UPDATE", "CREATE"}
+# Statement kinds the guard understands. Anything else (DROP, ALTER, CREATE,
+# TRUNCATE, GRANT, COPY, EXPLAIN, ...) is rejected: the guard is an allowlist.
+WRITE_KINDS = {"insert", "update", "delete"}
 
 # --- Schema ---
 def get_schema(engine) -> list[dict]:
@@ -62,20 +64,59 @@ def classify_intent(query: str) -> dict:
     }
 
 # --- Validation ---
-def validate_sql(sql: str, known_tables: set, dialect: str = "postgres") -> dict:
-    try:
-        parsed = sqlglot.parse_one(sql, dialect=dialect)
-    except sqlglot.errors.ParseError as e:
-        return {"valid": False, "error": f"Syntax error: {e}"}
-    if parsed.key.upper() in BLOCKED_OPS:
-        return {"valid": False, "error": f"Operation not allowed: {parsed.key.upper()}"}
+def classify_statement(parsed) -> str:
+    """Return 'read', 'insert', 'update', 'delete', or 'other'.
+    'other' means any statement type that is not explicitly allowed."""
+    exp = sqlglot.exp
+    if isinstance(parsed, exp.Insert):
+        return "insert"
+    if isinstance(parsed, exp.Update):
+        return "update"
+    if isinstance(parsed, exp.Delete):
+        return "delete"
+    if isinstance(parsed, (exp.Select, exp.SetOperation)):
+        return "read"
+    return "other"
 
-    referenced = {t.name.lower() for t in parsed.find_all(sqlglot.exp.Table)}
+
+def validate_sql(sql: str, known_tables: set, dialect: str = "postgres",
+                 allow_writes: bool = False) -> dict:
+    exp = sqlglot.exp
+
+    # 1. parse; exactly one statement (blocks "SELECT 1; DROP TABLE x")
+    try:
+        statements = [s for s in sqlglot.parse(sql, dialect=dialect) if s]
+    except sqlglot.errors.ParseError as e:
+        return {"valid": False, "error": f"Syntax error: {e}", "kind": None}
+    if len(statements) != 1:
+        return {"valid": False, "kind": None,
+                "error": "Only a single SQL statement is allowed."}
+    parsed = statements[0]
+
+    # 2. statement type must be on the allowlist
+    kind = classify_statement(parsed)
+    if kind == "other":
+        return {"valid": False, "kind": kind,
+                "error": f"Operation not allowed: {parsed.key.upper()}"}
+    if kind in WRITE_KINDS and not allow_writes:
+        return {"valid": False, "kind": kind,
+                "error": f"Write operations are disabled: {kind.upper()}"}
+
+    # 3. no hidden writes: data-modifying CTEs, SELECT ... INTO (creates a table)
+    nested = [n for n in parsed.find_all(exp.Insert, exp.Update, exp.Delete)
+              if n is not parsed]
+    if nested or parsed.find(exp.Into):
+        return {"valid": False, "kind": kind,
+                "error": "Nested writes and SELECT INTO are not allowed."}
+
+    # 4. every referenced table must exist (CTE names are not real tables)
+    cte_names = {c.alias.lower() for c in parsed.find_all(exp.CTE)}
+    referenced = {t.name.lower() for t in parsed.find_all(exp.Table)} - cte_names
     unknown = referenced - known_tables
     if unknown:
-        return {"valid": False, "error": f"Unknown tables: {unknown}"}
+        return {"valid": False, "kind": kind, "error": f"Unknown tables: {unknown}"}
 
-    return {"valid": True, "error": None}
+    return {"valid": True, "error": None, "kind": kind}
 
 # --- Confidence ---
 def score_confidence(sql: str, schema: str, valid: bool) -> float:
@@ -104,9 +145,18 @@ def clean_sql(raw: str) -> str:
     return raw.strip()
 
 # --- Extract SQL ---
+# Finds where the SQL starts. Write statements are matched only in their full
+# opening form (INSERT INTO / UPDATE x SET / DELETE FROM) so ordinary words in
+# a chatty reply ("to update the price...") are not mistaken for SQL. Whether a
+# write is *allowed* is decided later, in validate_sql, not here.
+_SQL_START = re.compile(
+    r"\b(SELECT\b|WITH\b|INSERT\s+INTO\b|UPDATE\s+\S+\s+SET\b|DELETE\s+FROM\b)",
+    re.IGNORECASE,
+)
+
 def extract_sql(raw: str) -> str:
     raw = clean_sql(raw or "")
-    m = re.search(r"\b(SELECT|WITH)\b", raw, re.IGNORECASE)
+    m = _SQL_START.search(raw)
     return raw[m.start():].strip() if m else ""
 
 
@@ -117,7 +167,8 @@ def run_query(
     api_key: str,
     model: str = os.getenv("LLM_MODEL_GROQ", "openai/gpt-oss-120b"),
     base_url: str = "https://api.groq.com/openai/v1",
-    history: list = []
+    history: list = [],
+    allow_writes: bool = False
 ) -> dict:
     engine = create_engine(db_url)
     dialect = "sqlite" if "sqlite" in db_url else "postgres"
@@ -156,13 +207,21 @@ Use {dialect} syntax only. Return only the SQL query, nothing else."""}
                 "confidence": 0.0,
                 "error": raw.strip()[:300] or "Could not generate SQL — try rephrasing."}
     # validate
-    validation = validate_sql(sql, known_tables, dialect=dialect)
+    validation = validate_sql(sql, known_tables, dialect=dialect, allow_writes=allow_writes)
     if not validation["valid"]:
         return {"sql": sql, "rows": [], "intent": intent["intent"],
                 "confidence": 0.0, "error": validation["error"]}
 
-    # execute
     confidence = score_confidence(sql, schema, True)
+
+    # writes are never executed here: they are handed back for the
+    # preview -> confirm -> transaction flow (next step of v2)
+    if validation["kind"] != "read":
+        return {"sql": sql, "rows": [], "kind": validation["kind"],
+                "pending_write": True, "intent": intent["intent"],
+                "confidence": confidence, "error": None}
+
+    # execute
     try:
         with engine.connect() as conn:
             result = conn.execute(text(sql))
@@ -176,6 +235,7 @@ Use {dialect} syntax only. Return only the SQL query, nothing else."""}
         "sql": sql,
         "rows": rows,
         "columns": columns,
+        "kind": "read",
         "intent": intent["intent"],
         "confidence": confidence,
         "warning": "Low confidence — verify results" if confidence < 0.5 else None,
