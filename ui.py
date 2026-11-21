@@ -3,7 +3,7 @@ import uuid
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
-from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write
+from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write, get_audit_log
 
 MAX_FILES = 5
 MAX_MB = 10
@@ -117,6 +117,20 @@ with st.sidebar:
     st.divider()
     st.header("Session")
     st.caption(f"ID: {st.session_state.session_id[:8]}...")
+
+    with st.expander("Change log (this session)"):
+        entries = get_audit_log(session_id=st.session_state.session_id, limit=20)
+        if not entries:
+            st.caption("No changes yet.")
+        for e in entries:
+            st.markdown(
+                f"**#{e['id']}** {e['kind'].upper()} on `{e['table_name']}`: "
+                f"**{e['status']}**, {e['rows_affected']} row(s)"
+            )
+            st.caption(e["ts"])
+            st.code(e["sql"], language="sql")
+            if e.get("error"):
+                st.caption(f"Error: {e['error']}")
 
     if st.button("New conversation"):
         st.session_state.session_id = str(uuid.uuid4())
