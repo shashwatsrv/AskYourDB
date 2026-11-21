@@ -3,6 +3,7 @@ import uuid
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write, get_audit_log
 
 MAX_FILES = 5
@@ -18,6 +19,16 @@ def get_secret(name: str, default: str = "") -> str:
         return st.secrets[name]
     except Exception:
         return os.getenv(name, default)
+
+def describe_target(url: str) -> str:
+    """Human-readable database name for a connection URL, never including credentials."""
+    try:
+        u = make_url(url)
+    except Exception:
+        return "the connected database"
+    if u.get_backend_name() == "sqlite":
+        return "your uploaded files (temporary copy)"
+    return f"{u.host or 'localhost'} / {u.database}"
 
 
 # --- Session state ---
@@ -90,7 +101,9 @@ with st.sidebar:
         )
     elif source == "Postgres":
         st.caption("Edits are off for the shared demo database.")
-    if not allow_writes:
+    if allow_writes:
+        st.warning(f"Edits will modify: {describe_target(db_url)}")
+    else:
         st.session_state.pop("pending", None)
 
     st.divider()
@@ -195,6 +208,7 @@ if pending:
         st.subheader(f"Review proposed {kind.upper()}")
         st.code(pending["sql"], language="sql")
         label = "Rows to be added" if kind == "insert" else "Rows currently matching (before the change)"
+        st.caption(f"Database: {describe_target(pending['db_url'])}")
         st.caption(f"Table: `{pv.get('table')}` | {label}: {pv['total']}")
         for w in pv.get("warnings", []):
             st.warning(w)
