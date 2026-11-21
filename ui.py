@@ -2,6 +2,7 @@ import streamlit as st
 import uuid
 import os
 import pandas as pd
+import re
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write, get_audit_log
@@ -30,6 +31,25 @@ def describe_target(url: str) -> str:
         return "your uploaded files (temporary copy)"
     return f"{u.host or 'localhost'} / {u.database}"
 
+def friendly_error(err) -> str:
+    """Turn raw database / guard errors into short plain-language messages."""
+    msg = str(err or "")
+    msg = re.sub(r"\[SQL:.*", "", msg, flags=re.S)
+    msg = re.sub(r"\(Background on this error at:[^)]*\)", "", msg).strip()
+    low = msg.lower()
+    m = re.search(r"DETAIL:\s*(.*)", msg, flags=re.S)
+    detail = m.group(1).strip() if m else ""
+    if "notnullviolation" in low or "not null constraint" in low:
+        head = "A required column was left empty (it cannot be NULL). Include a value for every required column, such as the ID."
+    elif "uniqueviolation" in low or "unique constraint" in low:
+        head = "That would duplicate a value that must be unique, such as an ID that already exists."
+    elif "foreignkeyviolation" in low or "foreign key constraint" in low:
+        head = "Blocked by a link between tables: other rows still reference these rows, or the referenced row does not exist."
+    elif "only a single sql statement" in low:
+        head = "The model produced more than one statement. Ask about one table at a time, or name the table."
+    else:
+        return msg or "Unknown error."
+    return f"{head} {detail}".strip()
 
 # --- Session state ---
 if "session_id" not in st.session_state:
@@ -247,7 +267,7 @@ if pending:
             if source == "CSV / XLSX":
                 refresh_upload_counts(pending["db_url"])
         else:
-            msg = f"Not applied ({res['status']}): {res.get('error')}"
+            msg = f"Not applied, no data was changed ({res['status']}). {friendly_error(res.get('error'))}"
         st.session_state.messages.append({"role": "assistant", "content": msg, "sql": pending["sql"]})
         st.rerun()
 
@@ -273,10 +293,10 @@ if prompt := st.chat_input("Ask a question about your data..."):
                 )
 
                 if output.get("error"):
-                    st.error(f"Error: {output['error']}")
+                    st.error(f"Error: {friendly_error(output['error'])}")
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": f"Error: {output['error']}"
+                        "content": f"Error: {friendly_error(output['error'])}"
                     })
 
                 elif output.get("notice"):
