@@ -2,7 +2,8 @@ import streamlit as st
 import uuid
 import os
 import pandas as pd
-from app.core import run_query, explain_sql, load_files_to_sqlite
+from sqlalchemy import create_engine, text
+from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write
 
 MAX_FILES = 5
 MAX_MB = 10
@@ -33,6 +34,7 @@ with st.sidebar:
     source = st.radio("Connect via", ["Postgres", "CSV / XLSX"], index=0)
 
     db_url = None
+    user_db_url = ""
     if source == "Postgres":
         # Defaults are never placed in the widget, so the eye icon only
         # reveals what the visitor typed themselves.
@@ -76,6 +78,21 @@ with st.sidebar:
             db_url = st.session_state.upload_db_url
             for t in st.session_state.upload_tables:
                 st.success(f"`{t['table']}` ({t['rows']} rows) from {t['source']}")
+    # Edits are only offered on the visitor's own data: uploaded files,
+    # or a connection string they typed. Never the default demo database.
+    can_edit = bool(db_url) and (source == "CSV / XLSX" or bool(user_db_url))
+    allow_writes = False
+    if can_edit:
+        allow_writes = st.toggle(
+            "Enable edits (INSERT / UPDATE / DELETE)",
+            value=False,
+            help="Every change is previewed, needs your confirmation, runs in a transaction and is logged."
+        )
+    elif source == "Postgres":
+        st.caption("Edits are off for the shared demo database.")
+    if not allow_writes:
+        st.session_state.pop("pending", None)
+
     st.divider()
     st.header("LLM")
     mode = st.radio("Inference mode", ["Cloud (Groq)", "Local (Ollama)"], index=0)
@@ -140,9 +157,75 @@ for msg in st.session_state.messages:
         if msg.get("warning"):
             st.warning(msg["warning"])
 
+# --- Pending write: preview + confirm ---
+def refresh_upload_counts(url):
+    """After a committed change on uploaded files, update the sidebar row counts."""
+    try:
+        eng = create_engine(url)
+        with eng.connect() as conn:
+            for t in st.session_state.get("upload_tables", []):
+                t["rows"] = conn.execute(text(f'SELECT COUNT(*) FROM "{t["table"]}"')).scalar()
+        eng.dispose()
+    except Exception:
+        pass
+
+
+pending = st.session_state.get("pending")
+if pending:
+    pv = pending["preview"]
+    kind = pending["kind"]
+    needs_all_rows = kind in ("update", "delete") and not pv.get("has_where")
+    needs_typed = kind == "delete" or needs_all_rows
+
+    with st.container(border=True):
+        st.subheader(f"Review proposed {kind.upper()}")
+        st.code(pending["sql"], language="sql")
+        label = "Rows to be added" if kind == "insert" else "Rows currently matching (before the change)"
+        st.caption(f"Table: `{pv.get('table')}` | {label}: {pv['total']}")
+        for w in pv.get("warnings", []):
+            st.warning(w)
+        if pv.get("rows"):
+            st.dataframe(pd.DataFrame(pv["rows"], columns=pv.get("columns")))
+
+        typed = ""
+        if needs_typed:
+            typed = st.text_input("Type CONFIRM to enable the button", key=f"confirm_{pending['id']}")
+        c1, c2 = st.columns(2)
+        confirm = c1.button(
+            "Confirm and run", type="primary",
+            disabled=needs_typed and typed.strip() != "CONFIRM",
+        )
+        cancel = c2.button("Cancel")
+
+    if cancel:
+        st.session_state.pending = None
+        st.session_state.messages.append({"role": "assistant", "content": "Change cancelled. Nothing was modified."})
+        st.rerun()
+
+    if confirm:
+        with st.spinner("Running in a transaction..."):
+            res = execute_write(
+                db_url=pending["db_url"],
+                sql=pending["sql"],
+                expected_total=pv["total"],
+                session_id=st.session_state.session_id,
+                allow_all_rows=needs_all_rows,
+            )
+        st.session_state.pending = None
+        if res["ok"]:
+            st.session_state.history.append({"role": "user", "content": pending["prompt"]})
+            st.session_state.history.append({"role": "assistant", "content": pending["sql"]})
+            msg = f"Committed: {res['rows_affected']} row(s) affected (audit #{res['audit_id']})."
+            if source == "CSV / XLSX":
+                refresh_upload_counts(pending["db_url"])
+        else:
+            msg = f"Not applied ({res['status']}): {res.get('error')}"
+        st.session_state.messages.append({"role": "assistant", "content": msg, "sql": pending["sql"]})
+        st.rerun()
 
 # --- Input ---
 if prompt := st.chat_input("Ask a question about your data..."):
+    st.session_state.pending = None  # a new question discards any unconfirmed change
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("user"):
@@ -157,7 +240,8 @@ if prompt := st.chat_input("Ask a question about your data..."):
                     api_key=api_key,
                     model=model,
                     base_url=base_url,
-                    history=st.session_state.history
+                    history=st.session_state.history,
+                    allow_writes=allow_writes
                 )
 
                 if output.get("error"):
@@ -166,6 +250,22 @@ if prompt := st.chat_input("Ask a question about your data..."):
                         "role": "assistant",
                         "content": f"Error: {output['error']}"
                     })
+
+                elif output.get("pending_write"):
+                    st.session_state.pending = {
+                        "id": str(uuid.uuid4()),
+                        "prompt": prompt,
+                        "sql": output["sql"],
+                        "kind": output["kind"],
+                        "preview": output["preview"],
+                        "db_url": db_url,
+                    }
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "Proposed change ready. Review the preview below, then confirm or cancel.",
+                        "sql": output["sql"],
+                    })
+                    st.rerun()
 
                 else:
                     st.write("Query executed successfully.")
