@@ -9,6 +9,9 @@ import numpy as np
 import sqlite3
 import pandas as pd
 import tempfile
+import json
+from datetime import datetime, timezone
+from sqlalchemy.engine import make_url
 
 # --- Models (loaded once) ---
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -118,6 +121,106 @@ def validate_sql(sql: str, known_tables: set, dialect: str = "postgres",
 
     return {"valid": True, "error": None, "kind": kind}
 
+def _as_text(sql: str):
+    """Wrap generated SQL for SQLAlchemy. Colons are escaped so a literal like
+    'see :ref' is never mistaken for a bind parameter."""
+    return text(sql.replace(":", r"\:"))
+
+
+# --- Write preview ---
+WRITE_ROW_WARN = 100   # warn when a write touches more rows than this
+PREVIEW_SAMPLE = 50    # max rows shown in a preview
+
+
+class PreviewError(Exception):
+    """Raised when a write cannot be previewed safely. The write is then refused."""
+
+
+def build_preview(sql: str, dialect: str = "postgres") -> dict:
+    """Turn a validated INSERT/UPDATE/DELETE into a description of what it would touch.
+    UPDATE/DELETE -> a SELECT of the rows that match the WHERE clause (the 'before' image).
+    INSERT ... VALUES -> the literal rows to be added.
+    INSERT ... SELECT -> that SELECT.
+    Forms we cannot preview faithfully are refused (fail closed)."""
+    exp = sqlglot.exp
+    parsed = sqlglot.parse_one(sql, dialect=dialect)
+    kind = classify_statement(parsed)
+
+    if kind in ("update", "delete"):
+        if parsed.args.get("from_") or parsed.args.get("from") or parsed.args.get("using"):
+            raise PreviewError(f"{kind.upper()} with FROM/USING is not supported yet.")
+        table = parsed.this
+        select = exp.select("*").from_(table.copy())
+        where = parsed.args.get("where")
+        if where is not None:
+            select = select.where(where.this.copy())
+        return {"kind": kind, "table": table.name, "has_where": where is not None,
+                "preview_sql": select.sql(dialect=dialect)}
+
+    if kind == "insert":
+        if parsed.args.get("conflict"):
+            raise PreviewError("INSERT ... ON CONFLICT is not supported yet.")
+        target = parsed.this
+        is_schema = isinstance(target, exp.Schema)
+        table = (target.this if is_schema else target).name
+        columns = [c.name for c in target.expressions] if is_schema else []
+        source = parsed.args.get("expression")
+        if isinstance(source, exp.Values):
+            rows = [[e.sql(dialect=dialect) for e in tup.expressions]
+                    for tup in source.expressions]
+            return {"kind": kind, "table": table, "has_where": True,
+                    "columns": columns, "literal_rows": rows}
+        if isinstance(source, (exp.Select, exp.SetOperation)):
+            return {"kind": kind, "table": table, "has_where": True,
+                    "preview_sql": source.sql(dialect=dialect)}
+        raise PreviewError("This INSERT form is not supported yet.")
+
+    raise PreviewError(f"Cannot preview a {kind} statement.")
+
+
+def run_preview(engine, info: dict, dialect: str = "postgres") -> dict:
+    """Run the (read-only) preview and collect warnings. Never modifies data."""
+    kind, table = info["kind"], info["table"]
+    columns, rows, total = [], [], 0
+
+    if info.get("preview_sql"):
+        psql = info["preview_sql"]
+        # defence in depth: the preview itself must be one plain read
+        checked = sqlglot.parse(psql, dialect=dialect)
+        if len(checked) != 1 or classify_statement(checked[0]) != "read":
+            raise PreviewError("Could not build a safe preview.")
+        with engine.connect() as conn:
+            total = conn.execute(_as_text(f"SELECT COUNT(*) FROM ({psql}) AS _preview")).scalar()
+            res = conn.execute(_as_text(f"SELECT * FROM ({psql}) AS _preview LIMIT {PREVIEW_SAMPLE}"))
+            columns = list(res.keys())
+            rows = [list(r) for r in res.fetchall()]
+    else:
+        rows = info["literal_rows"]
+        total = len(rows)
+        columns = info.get("columns") or []
+        if not columns:
+            try:
+                real = [c["name"] for c in inspect(engine).get_columns(table)]
+            except Exception:
+                real = []
+            width = len(rows[0]) if rows else 0
+            columns = real if len(real) == width else [f"col{i + 1}" for i in range(width)]
+
+    warnings = []
+    if kind in ("update", "delete"):
+        if not info["has_where"]:
+            warnings.append(f"No WHERE clause: this will change ALL rows in {table}.")
+        if total == 0:
+            warnings.append("No rows match, so nothing would change.")
+    elif total == 0:
+        warnings.append("No rows would be inserted.")
+    if total > WRITE_ROW_WARN:
+        warnings.append(f"This affects {total} rows (more than {WRITE_ROW_WARN}).")
+
+    return {"table": table, "preview_sql": info.get("preview_sql"), "columns": columns,
+            "rows": rows, "total": total, "has_where": info["has_where"],
+            "warnings": warnings}
+
 # --- Confidence ---
 def score_confidence(sql: str, schema: str, valid: bool) -> float:
     try:
@@ -150,7 +253,8 @@ def clean_sql(raw: str) -> str:
 # a chatty reply ("to update the price...") are not mistaken for SQL. Whether a
 # write is *allowed* is decided later, in validate_sql, not here.
 _SQL_START = re.compile(
-    r"\b(SELECT\b|WITH\b|INSERT\s+INTO\b|UPDATE\s+\S+\s+SET\b|DELETE\s+FROM\b)",
+    r"\b(SELECT\b|WITH\b|INSERT\s+INTO\b"
+    r"|UPDATE\s+[\w.\"]+(?:\s+(?:AS\s+)?\w+)?\s+SET\b|DELETE\s+FROM\b)",
     re.IGNORECASE,
 )
 
@@ -214,17 +318,25 @@ Use {dialect} syntax only. Return only the SQL query, nothing else."""}
 
     confidence = score_confidence(sql, schema, True)
 
-    # writes are never executed here: they are handed back for the
-    # preview -> confirm -> transaction flow (next step of v2)
+    # writes are never executed here: they are previewed (read-only) and handed
+    # back for the confirm -> transaction flow (next step of v2)
     if validation["kind"] != "read":
+        try:
+            preview = run_preview(engine, build_preview(sql, dialect), dialect)
+        except PreviewError as e:
+            return {"sql": sql, "rows": [], "intent": intent["intent"],
+                    "confidence": confidence, "error": f"Cannot preview this write: {e}"}
+        except Exception as e:
+            return {"sql": sql, "rows": [], "intent": intent["intent"],
+                    "confidence": confidence, "error": str(e)}
         return {"sql": sql, "rows": [], "kind": validation["kind"],
-                "pending_write": True, "intent": intent["intent"],
-                "confidence": confidence, "error": None}
+                "pending_write": True, "preview": preview,
+                "intent": intent["intent"], "confidence": confidence, "error": None}
 
     # execute
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(sql))
+            result = conn.execute(_as_text(sql))
             rows = [list(r) for r in result.fetchall()]
             columns = list(result.keys())
     except Exception as e:
@@ -241,6 +353,148 @@ Use {dialect} syntax only. Return only the SQL query, nothing else."""}
         "warning": "Low confidence — verify results" if confidence < 0.5 else None,
         "error": None
     }
+
+# --- Write execution (v2) ---
+AUDIT_DB_PATH = os.getenv("ASKYOURDB_AUDIT_DB",
+                          os.path.join(tempfile.gettempdir(), "askyourdb_audit.db"))
+AUDIT_OLD_ROWS_MAX = 1000   # max rows of old values stored per audit entry
+
+
+class WriteAborted(Exception):
+    """Raised inside the transaction to abort a write that no longer matches the preview."""
+
+
+def _audit_conn():
+    conn = sqlite3.connect(AUDIT_DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS write_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, session_id TEXT, database TEXT, kind TEXT, table_name TEXT,
+        sql TEXT, expected_rows INTEGER, rows_affected INTEGER,
+        old_values TEXT, old_values_truncated INTEGER,
+        status TEXT, error TEXT)""")
+    return conn
+
+
+def _db_label(db_url: str) -> str:
+    """Host/database only. Never user names or passwords."""
+    u = make_url(db_url)
+    return f"{u.get_backend_name()}://{u.host or ''}/{u.database or ''}"
+
+
+def _audit_start(session_id, db_url, kind, table, sql, expected) -> int:
+    with _audit_conn() as conn:   # the with-block commits
+        cur = conn.execute(
+            "INSERT INTO write_audit (ts, session_id, database, kind, table_name, sql,"
+            " expected_rows, status) VALUES (?,?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), session_id,
+             _db_label(db_url), kind, table, sql, expected, "started"))
+        return cur.lastrowid
+
+
+def _audit_finish(audit_id, status, rows_affected=None, old_rows=None,
+                  truncated=False, error=None):
+    old = json.dumps(old_rows, default=str) if old_rows is not None else None
+    with _audit_conn() as conn:
+        conn.execute(
+            "UPDATE write_audit SET status=?, rows_affected=?, old_values=?,"
+            " old_values_truncated=?, error=? WHERE id=?",
+            (status, rows_affected, old, int(truncated), error, audit_id))
+
+
+def get_audit_log(session_id: str | None = None, limit: int = 20) -> list[dict]:
+    """Most recent audit entries, newest first (optionally for one session)."""
+    with _audit_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        if session_id:
+            rows = conn.execute("SELECT * FROM write_audit WHERE session_id=?"
+                                " ORDER BY id DESC LIMIT ?", (session_id, limit))
+        else:
+            rows = conn.execute("SELECT * FROM write_audit ORDER BY id DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows.fetchall()]
+
+
+def execute_write(db_url: str, sql: str, expected_total: int,
+                  session_id: str = "", allow_all_rows: bool = False) -> dict:
+    """Run ONE confirmed write inside a transaction.
+
+    Safety rules, all enforced here (not only in the UI):
+      1. the SQL is re-validated from scratch (allowlist, one statement, real tables)
+      2. UPDATE/DELETE without WHERE needs allow_all_rows=True
+      3. the intent is written to the audit log BEFORE anything changes; no audit, no write
+      4. inside the transaction the matching row count must equal what the user
+         confirmed (expected_total), otherwise nothing is written
+      5. after the write, rows affected must equal that count, otherwise it is rolled back
+      6. any error rolls the whole transaction back
+    Returns {"ok", "status", "rows_affected", "audit_id", "error"}.
+    status is one of: committed, aborted, rolled_back, refused."""
+    def result(ok, status, affected=None, audit_id=None, error=None):
+        return {"ok": ok, "status": status, "rows_affected": affected,
+                "audit_id": audit_id, "error": error}
+
+    engine = create_engine(db_url)
+    dialect = "sqlite" if "sqlite" in db_url else "postgres"
+
+    # 1. validate again from scratch
+    chunks = get_schema(engine)
+    known_tables = {c["table"].lower() for c in chunks}
+    validation = validate_sql(sql, known_tables, dialect=dialect, allow_writes=True)
+    if not validation["valid"]:
+        return result(False, "refused", error=validation["error"])
+    if validation["kind"] == "read":
+        return result(False, "refused", error="Not a write statement.")
+    try:
+        info = build_preview(sql, dialect)
+    except PreviewError as e:
+        return result(False, "refused", error=f"Cannot preview this write: {e}")
+
+    # 2. all-rows guard
+    if info["kind"] in ("update", "delete") and not info["has_where"] and not allow_all_rows:
+        return result(False, "refused",
+                      error="No WHERE clause: this needs the explicit all-rows confirmation.")
+
+    # 3. write-ahead audit entry
+    try:
+        audit_id = _audit_start(session_id, db_url, info["kind"], info["table"], sql, expected_total)
+    except Exception as e:
+        return result(False, "refused", error=f"Audit log unavailable, write not executed: {e}")
+
+    old_rows, truncated = None, False
+    try:
+        with engine.begin() as conn:   # commits on success, rolls back on any exception
+            # 4. count inside the transaction and compare with what was confirmed
+            if info.get("preview_sql"):
+                psql = info["preview_sql"]
+                total = conn.execute(_as_text(f"SELECT COUNT(*) FROM ({psql}) AS _p")).scalar()
+                if info["kind"] in ("update", "delete"):
+                    res = conn.execute(_as_text(
+                        f"SELECT * FROM ({psql}) AS _p LIMIT {AUDIT_OLD_ROWS_MAX}"))
+                    cols = list(res.keys())
+                    old_rows = [dict(zip(cols, r)) for r in res.fetchall()]
+                    truncated = total > AUDIT_OLD_ROWS_MAX
+            else:
+                total = len(info["literal_rows"])
+            if total != expected_total:
+                raise WriteAborted(f"The data changed since the preview ({total} rows now "
+                                   f"match, {expected_total} were confirmed). Run it again.")
+
+            # the write itself
+            affected = conn.execute(_as_text(sql)).rowcount
+
+            # 5. what happened must equal what was confirmed
+            if affected != total:
+                raise WriteAborted(f"The write affected {affected} rows but {total} were "
+                                   f"previewed. Rolled back.")
+    except WriteAborted as e:
+        _audit_finish(audit_id, "aborted", error=str(e))
+        return result(False, "aborted", audit_id=audit_id, error=str(e))
+    except Exception as e:   # 6. anything else: the transaction has been rolled back
+        _audit_finish(audit_id, "rolled_back", error=str(e))
+        return result(False, "rolled_back", audit_id=audit_id, error=str(e))
+
+    _audit_finish(audit_id, "committed", rows_affected=affected,
+                  old_rows=old_rows, truncated=truncated)
+    return result(True, "committed", affected, audit_id)
+
 
 # --- Explain ---
 def explain_sql(sql: str, api_key: str, model: str, base_url: str) -> str:
