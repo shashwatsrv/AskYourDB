@@ -90,7 +90,9 @@ def validate_sql(sql: str, known_tables: set, dialect: str = "postgres",
     try:
         statements = [s for s in sqlglot.parse(sql, dialect=dialect) if s]
     except sqlglot.errors.ParseError as e:
-        return {"valid": False, "error": f"Syntax error: {e}", "kind": None}
+        import re
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+        return {"valid": False, "error": f"Syntax error: {msg}", "kind": None}
     if len(statements) != 1:
         return {"valid": False, "kind": None,
                 "error": "Only a single SQL statement is allowed."}
@@ -253,7 +255,9 @@ def clean_sql(raw: str) -> str:
 # a chatty reply ("to update the price...") are not mistaken for SQL. Whether a
 # write is *allowed* is decided later, in validate_sql, not here.
 _SQL_START = re.compile(
-    r"\b(SELECT\b|WITH\b|INSERT\s+INTO\b"
+    r"\b(SELECT\b"
+    r"|WITH\s+(?:RECURSIVE\s+)?[\w.\"]+\s*(?:\([^)]*\)\s*)?AS\s*(?:NOT\s+MATERIALIZED\s+|MATERIALIZED\s+)?\("
+    r"|INSERT\s+INTO\b"
     r"|UPDATE\s+[\w.\"]+(?:\s+(?:AS\s+)?\w+)?\s+SET\b|DELETE\s+FROM\b)",
     re.IGNORECASE,
 )
@@ -288,6 +292,13 @@ def run_query(
     top_k = len(chunks) if intent["intent"] == "ambiguous" else 6
     schema = retrieve_schema(user_input, chunks, top_k=top_k)
 
+    # extra instructions only when the visitor has enabled edits
+    write_note = ""
+    if allow_writes:
+        write_note = """
+
+Data changes are enabled. If the user asks to add, change or remove data, return exactly ONE INSERT, UPDATE or DELETE statement (the query hint above does not apply to it). Rules: use only tables and columns from the schema; list column names explicitly in INSERT and put all new rows in one multi-row VALUES list; give every UPDATE and DELETE a WHERE clause unless the user clearly asks for all rows; never use DDL (CREATE, ALTER, DROP, TRUNCATE); never invent values the user did not give. If the user only asks to see data, return a SELECT as usual."""
+
     # build messages
     messages = [
         {"role": "system", "content": f"""You are a {dialect.upper()} expert. Given this schema:
@@ -295,7 +306,7 @@ def run_query(
 
 Query hint: {intent['hint']}
 
-Use {dialect} syntax only. Return only the SQL query, nothing else."""}
+Use {dialect} syntax only. Return only the SQL query, nothing else.{write_note}"""}
     ]
     messages.extend(history[-10:])
     messages.append({"role": "user", "content": user_input})
@@ -306,12 +317,22 @@ Use {dialect} syntax only. Return only the SQL query, nothing else."""}
     sql = extract_sql(raw)
 
     # guard
+    if not sql and re.match(r"\s*(DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE)\b", raw, re.IGNORECASE):
+        return {"sql": "", "rows": [], "intent": intent["intent"], "confidence": 0.0,
+                "error": None,
+                "notice": "Blocked: schema changes (DROP, ALTER, CREATE, TRUNCATE) are never allowed. "
+                          "Only INSERT, UPDATE and DELETE are supported."}
     if not sql:
         return {"sql": "", "rows": [], "intent": intent["intent"],
                 "confidence": 0.0,
-                "error": raw.strip()[:300] or "Could not generate SQL — try rephrasing."}
+                "error": None, "notice": raw.strip()[:300] or "Could not generate SQL — try rephrasing."}
     # validate
     validation = validate_sql(sql, known_tables, dialect=dialect, allow_writes=allow_writes)
+    if (not validation["valid"] and validation["kind"] is None
+            and validation["error"].startswith("Syntax error")):
+        # the model most likely answered in prose: show its text, not a parser error
+        return {"sql": "", "rows": [], "intent": intent["intent"], "confidence": 0.0,
+                "error": None, "notice": raw.strip()[:300]}
     if not validation["valid"]:
         return {"sql": sql, "rows": [], "intent": intent["intent"],
                 "confidence": 0.0, "error": validation["error"]}
