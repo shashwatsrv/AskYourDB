@@ -2,7 +2,7 @@
 
 Ask your database questions in plain English. AskYourDB turns a question into SQL, validates it, runs it, shows the results, and explains the query back to you.
 
-**Live demo:** https://askurdb.streamlit.app/ (read-only Northwind database, or bring your own Postgres / CSV / XLSX)
+**Live demo:** https://askurdb.streamlit.app/ (read-only Northwind database, or bring your own Postgres / CSV / XLSX; edits are available on your own data only)
 
 ---
 
@@ -10,7 +10,7 @@ Ask your database questions in plain English. AskYourDB turns a question into SQ
 
 - **Natural language to SQL** for Postgres databases, or any CSV / XLSX file (loaded into a temporary SQLite database)
 - **Schema-aware generation**: only the relevant tables are sent to the LLM (semantic schema retrieval)
-- **Safety first**: read-only queries only, validated on the AST before anything touches the database
+- **Safety first**: read-only by default, validated on the AST before anything touches the database. Optional edits on your own data are previewed, confirmed, run in a transaction and logged (see MakeYourDB below)
 - **Plain-English explanation** of every generated query
 - **Confidence score** and intent label shown with each answer
 - **Follow-up questions**: the last 10 messages are kept as context
@@ -67,6 +67,26 @@ Ask your database questions in plain English. AskYourDB turns a question into SQ
 
 ---
 
+## MakeYourDB (v2): controlled edits
+
+Edits are an opt-in mode (the **Enable edits** switch). Supported statements: `INSERT`, `UPDATE`, `DELETE`. Schema changes (`ALTER`, `DROP`, `CREATE`, `TRUNCATE`, ...) are never allowed.
+
+**Where edits are allowed:** uploaded CSV / XLSX files (each visitor edits their own temporary copy) and a Postgres connection string you paste yourself (your database, your permissions). The shared demo database is never writable: the app does not offer the switch for it, and its role is `SELECT`-only.
+
+**Safety layers**
+
+1. **Allowlist guard.** Exactly one statement; only `SELECT` (and `INSERT` / `UPDATE` / `DELETE` when edits are on). Multi-statement input, data-modifying CTEs and `SELECT ... INTO` are rejected, and every table must exist.
+2. **Preview, nothing changes yet.** `UPDATE` / `DELETE` show the rows that currently match (the "before" image), and `UPDATE` adds `new_<column>` values; `INSERT` shows the rows to be added. Warnings for no `WHERE`, no matching rows, and more than 100 rows. Forms that cannot be previewed faithfully (`UPDATE ... FROM`, `DELETE ... USING`, `ON CONFLICT`) are refused.
+3. **Explicit confirmation.** Confirm / Cancel, and a typed `CONFIRM` for every `DELETE` and for any `UPDATE` / `DELETE` without a `WHERE`.
+4. **Transaction with checks.** The statement is re-validated at execution. The number of matching rows must still equal the previewed count, and the rows affected must equal it afterwards; any mismatch or database error rolls everything back.
+5. **Audit log, written before the change.** If the log is unavailable, the write does not run. Entries hold time, session, database (credentials are never stored), SQL, row counts, the before-image (up to 1000 rows) and the outcome. The log is a separate SQLite file, so nothing is added to your database, and it is visible per session in the sidebar.
+
+**Helping the model write valid changes.** In edit mode the schema sent to the model flags columns as required, auto-filled or generated. For a single-row `INSERT` with no ID given, the model may fill a required integer ID with the next value (`MAX(id) + 1`); for any other missing required value it asks you.
+
+**Testing.** The guard, preview and execution layer were covered by 76 sandbox test cases during development (not yet a committed test suite). Live checks were run on SQLite (uploaded files) and on Postgres 16 (local Docker and a Neon branch): committed `INSERT` / `UPDATE` / `DELETE`, plus rollbacks on foreign-key and duplicate-key violations, verified directly in the database.
+
+---
+
 ## Two code paths
 
 The repository contains two versions of the pipeline.
@@ -90,7 +110,7 @@ The deployed app is deliberately lightweight so it runs on a free tier. The Fast
 
 - **The intent classifier is a hint, not a gate.** Zero-shot confidence is low and noisy (typically 0.3 to 0.5), so a wrong label must never block a query. It only nudges the prompt.
 - **Retrieve tables, don't dump the schema.** Sending only relevant tables keeps prompts small and reduces hallucinated columns. For vague questions the full schema is sent instead.
-- **Validate on the AST, not with regex.** sqlglot parses the query so blocked operations (`DROP`, `DELETE`, `ALTER`, `TRUNCATE`, `INSERT`, `UPDATE`, `CREATE`) and unknown tables are caught reliably, before execution.
+- **Validate on the AST, with an allowlist.** sqlglot parses the query, and only `SELECT` (plus `INSERT`, `UPDATE`, `DELETE` when edits are on) is accepted. Everything else, including multi-statement input, is rejected, and unknown tables are caught before execution.
 - **Defence in depth.** The public demo connects with a Postgres role that only has `SELECT`. Even if a bad query got through validation, the database would reject it.
 - **Secrets stay on the server.** Default credentials are never rendered in the UI. A visitor can paste their own connection string or API key, and those stay viewable to them for debugging.
 - **Confidence is grounded, not opaque.** It combines schema coverage (0.5), query complexity (0.3) and validity (0.2).
@@ -105,7 +125,11 @@ The deployed app is deliberately lightweight so it runs on a free tier. The Fast
 - **Ambiguous wording gets an interpretation.** "Most expensive product" can mean highest unit price or highest total spend. The model picks one. Be specific for exact results.
 - **Confidence is a heuristic**, not a calibrated probability. Validity is always 1.0 at scoring time because invalid queries return earlier.
 - **Ollama mode works only when run locally.**
-- **Read-only.** Write operations are not supported yet (see roadmap).
+- **Edits have no real user authentication.** The audit log identifies the Streamlit session, not a login.
+- **The audit log is ephemeral on Streamlit Community Cloud** (it lives in the OS temp directory; set `ASKYOURDB_AUDIT_DB` to keep it elsewhere).
+- **No undo yet.** Before-images are stored, but there is no restore button.
+- **The model can misread a request.** The preview and confirmation are the control. The app does not check column names or `NOT NULL` itself; the database rejects bad writes and the transaction rolls back.
+- **Not tested:** several users editing the same data at once, and edits through the deployed Streamlit Cloud app.
 
 ---
 
@@ -179,12 +203,9 @@ uvicorn app.main:app --reload
 
 ## Roadmap
 
-**MakeYourDB (v2)**: controlled write operations, built only after v1 is solid.
+**Done in v2:** `INSERT` / `UPDATE` / `DELETE` with preview, confirmation, transaction rollback and an audit log.
 
-- `INSERT` first, then `UPDATE`, then `DELETE`. `ALTER` is never allowed.
-- Row preview before any change, explicit user confirmation, and a transaction wrapper with automatic rollback.
-- Audit log of every write.
-
+**Next:** undo from the stored before-images, a persistent audit log with real authentication, OCR ingestion (images and scans into a queryable database), foreign-key-aware schema retrieval, and a column-existence check.
 ---
 
 ## Author
