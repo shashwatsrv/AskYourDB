@@ -156,14 +156,15 @@ with st.sidebar:
         if not entries:
             st.caption("No changes yet.")
         for e in entries:
+            rows_txt = f", {e['rows_affected']} row(s)" if e.get("rows_affected") is not None else ""
             st.markdown(
                 f"**#{e['id']}** {e['kind'].upper()} on `{e['table_name']}`: "
-                f"**{e['status']}**, {e['rows_affected']} row(s)"
+                f"**{e['status']}**{rows_txt}"
             )
             st.caption(e["ts"])
             st.code(e["sql"], language="sql")
             if e.get("error"):
-                st.caption(f"Error: {e['error']}")
+                st.caption(f"Error: {friendly_error(e['error'])}")
 
     if st.button("New conversation"):
         st.session_state.session_id = str(uuid.uuid4())
