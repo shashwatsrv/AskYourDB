@@ -33,27 +33,48 @@ INTENT_HINTS = {
 WRITE_KINDS = {"insert", "update", "delete"}
 
 # --- Schema ---
+def _write_col_def(c, pk_cols) -> str:
+    """Column description for write mode: flags what an INSERT must supply."""
+    notes = []
+    if c["name"] in pk_cols:
+        notes.append("primary key")
+    if c.get("computed"):
+        notes.append("generated, never set it")
+    elif c.get("identity") or c.get("autoincrement") is True or c.get("default") is not None:
+        notes.append("auto-filled if omitted")
+    elif not c.get("nullable", True):
+        notes.append("REQUIRED on INSERT, no default")
+    extra = f", {', '.join(notes)}" if notes else ""
+    return f"{c['name']} ({c['type']}{extra})"
+
+
 def get_schema(engine) -> list[dict]:
     inspector = inspect(engine)
     chunks = []
     for table in inspector.get_table_names():
         columns = inspector.get_columns(table)
+        try:
+            pk_cols = set(inspector.get_pk_constraint(table).get("constrained_columns") or [])
+        except Exception:
+            pk_cols = set()
         col_defs = ", ".join(f"{c['name']} ({c['type']})" for c in columns)
+        write_defs = ", ".join(_write_col_def(c, pk_cols) for c in columns)
         chunks.append({
             "table": table,
-            "text": f"Table {table} has columns: {col_defs}"
+            "text": f"Table {table} has columns: {col_defs}",
+            "write_text": f"Table {table} has columns: {write_defs}",
         })
     return chunks
 
 # --- RAG ---
-def retrieve_schema(query: str, chunks: list[dict], top_k: int = 6) -> str:
+def retrieve_schema(query: str, chunks: list[dict], top_k: int = 6, field: str = "text") -> str:
     query_emb = embedding_model.encode(query)
     chunk_embs = embedding_model.encode([c["text"] for c in chunks])
     scores = np.dot(chunk_embs, query_emb) / (
         np.linalg.norm(chunk_embs, axis=1) * np.linalg.norm(query_emb) + 1e-9
     )
     top_indices = np.argsort(scores)[::-1][:top_k]
-    retrieved = [chunks[i]["text"] for i in top_indices]
+    retrieved = [chunks[i].get(field) or chunks[i]["text"] for i in top_indices]
     return "Relevant tables:\n" + "\n".join(f"- {t}" for t in retrieved)
 
 # --- Intent ---
@@ -313,18 +334,20 @@ def run_query(
     known_tables.update({"columns", "tables", "information_schema.columns"})
     top_k = len(chunks) if intent["intent"] == "ambiguous" else 6
     schema = retrieve_schema(user_input, chunks, top_k=top_k)
+    prompt_schema = (retrieve_schema(user_input, chunks, top_k=top_k, field="write_text")
+                     if allow_writes else schema)
 
     # extra instructions only when the visitor has enabled edits
     write_note = ""
     if allow_writes:
         write_note = """
 
-Data changes are enabled. If the user asks to add, change or remove data, return exactly ONE INSERT, UPDATE or DELETE statement (the query hint above does not apply to it). Rules: use only tables and columns from the schema; list column names explicitly in INSERT and put all new rows in one multi-row VALUES list; give every UPDATE and DELETE a WHERE clause unless the user clearly asks for all rows; never use DDL (CREATE, ALTER, DROP, TRUNCATE); never invent values the user did not give. If the user only asks to see data, return a SELECT as usual."""
+Data changes are enabled. If the user asks to add, change or remove data, return exactly ONE INSERT, UPDATE or DELETE statement (the query hint above does not apply to it). Rules: use only tables and columns from the schema; list column names explicitly in INSERT and put all new rows in one multi-row VALUES list; give every UPDATE and DELETE a WHERE clause unless the user clearly asks for all rows; never use DDL (CREATE, ALTER, DROP, TRUNCATE); never set columns marked generated. Columns marked REQUIRED have no default, so every INSERT must give them a value. Never invent values the user did not give, except that for a single-row INSERT a missing required integer ID column may be filled with (SELECT COALESCE(MAX(id_column), 0) + 1 FROM table_name). For any other missing required value, reply in plain text asking for it. If the user only asks to see data, return a SELECT as usual."""
 
     # build messages
     messages = [
         {"role": "system", "content": f"""You are a {dialect.upper()} expert. Given this schema:
-{schema}
+{prompt_schema}
 
 Query hint: {intent['hint']}
 
