@@ -305,6 +305,8 @@ if prompt := st.chat_input("Ask a question about your data..."):
                 elif output.get("notice"):
                     st.info(output["notice"])
                     st.session_state.messages.append({"role": "assistant", "content": output["notice"]})
+                    st.session_state.history.append({"role": "user", "content": prompt})
+                    st.session_state.history.append({"role": "assistant", "content": output["notice"]})
 
                 elif output.get("pending_write"):
                     st.session_state.pending = {
