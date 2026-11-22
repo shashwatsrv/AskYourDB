@@ -63,18 +63,26 @@ def classify_intent(query: str) -> dict:
 
 # --- Validation ---
 def validate_sql(sql: str, known_tables: set, dialect: str = "postgres") -> dict:
+    exp = sqlglot.exp
     try:
-        parsed = sqlglot.parse_one(sql, dialect=dialect)
+        statements = [s for s in sqlglot.parse(sql, dialect=dialect) if s]
     except sqlglot.errors.ParseError as e:
-        return {"valid": False, "error": f"Syntax error: {e}"}
-    if parsed.key.upper() in BLOCKED_OPS:
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+        return {"valid": False, "error": "Syntax error: " + msg}
+    if len(statements) != 1:
+        return {"valid": False, "error": "Only a single SQL statement is allowed."}
+    parsed = statements[0]
+    set_op = getattr(exp, "SetOperation", None) or exp.Union
+    if not isinstance(parsed, (exp.Select, set_op)):
         return {"valid": False, "error": f"Operation not allowed: {parsed.key.upper()}"}
-
-    referenced = {t.name.lower() for t in parsed.find_all(sqlglot.exp.Table)}
+    hidden = [n for n in parsed.find_all(exp.Insert, exp.Update, exp.Delete)]
+    if hidden or parsed.find(exp.Into):
+        return {"valid": False, "error": "Nested writes and SELECT INTO are not allowed."}
+    cte_names = {c.alias.lower() for c in parsed.find_all(exp.CTE)}
+    referenced = {t.name.lower() for t in parsed.find_all(exp.Table)} - cte_names
     unknown = referenced - known_tables
     if unknown:
         return {"valid": False, "error": f"Unknown tables: {unknown}"}
-
     return {"valid": True, "error": None}
 
 # --- Confidence ---
