@@ -156,9 +156,20 @@ def build_preview(sql: str, dialect: str = "postgres") -> dict:
         where = parsed.args.get("where")
         if where is not None:
             select = select.where(where.this.copy())
-        return {"kind": kind, "table": table.name, "has_where": where is not None,
+        info = {"kind": kind, "table": table.name, "has_where": where is not None,
                 "preview_sql": select.sql(dialect=dialect)}
-
+        if kind == "update":
+            # same rows plus the value each SET would write (display only)
+            sets = []
+            for eq in parsed.args.get("expressions") or []:
+                if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+                    sets.append(exp.alias_(eq.expression.copy(), f"new_{eq.this.name}"))
+            if sets:
+                after = exp.select("*", *sets).from_(table.copy())
+                if where is not None:
+                    after = after.where(where.this.copy())
+                info["after_sql"] = after.sql(dialect=dialect)
+        return info
     if kind == "insert":
         if parsed.args.get("conflict"):
             raise PreviewError("INSERT ... ON CONFLICT is not supported yet.")
@@ -196,6 +207,17 @@ def run_preview(engine, info: dict, dialect: str = "postgres") -> dict:
             res = conn.execute(_as_text(f"SELECT * FROM ({psql}) AS _preview LIMIT {PREVIEW_SAMPLE}"))
             columns = list(res.keys())
             rows = [list(r) for r in res.fetchall()]
+            after_sql = info.get("after_sql")
+            if after_sql:
+                try:
+                    chk = sqlglot.parse(after_sql, dialect=dialect)
+                    if len(chk) == 1 and classify_statement(chk[0]) == "read":
+                        res2 = conn.execute(_as_text(
+                            f"SELECT * FROM ({after_sql}) AS _preview LIMIT {PREVIEW_SAMPLE}"))
+                        columns = list(res2.keys())
+                        rows = [list(r) for r in res2.fetchall()]
+                except Exception:
+                    pass  # fall back to the plain before-image
     else:
         rows = info["literal_rows"]
         total = len(rows)

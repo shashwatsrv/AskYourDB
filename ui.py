@@ -230,6 +230,8 @@ if pending:
         label = "Rows to be added" if kind == "insert" else "Rows currently matching (before the change)"
         st.caption(f"Database: {describe_target(pending['db_url'])}")
         st.caption(f"Table: `{pv.get('table')}` | {label}: {pv['total']}")
+        if kind == "update":
+            st.caption("Columns starting with new_ show the value each row will have after the change.")
         for w in pv.get("warnings", []):
             st.warning(w)
         if pv.get("rows"):
