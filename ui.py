@@ -154,7 +154,8 @@ with st.sidebar:
                                        key=f"dl_all_{ver}")
     # Edits are only offered on the visitor's own data: uploaded files,
     # or a connection string they typed. Never the default demo database.
-    can_edit = bool(db_url) and (source == "CSV / XLSX" or bool(user_db_url))
+    edits_enabled = get_secret("ENABLE_EDITS", "false").strip().lower() == "true"
+    can_edit = edits_enabled and bool(db_url) and (source == "CSV / XLSX" or bool(user_db_url))
     allow_writes = False
     if can_edit:
         allow_writes = st.toggle(
@@ -162,6 +163,8 @@ with st.sidebar:
             value=False,
             help="Every change is previewed, needs your confirmation, runs in a transaction and is logged."
         )
+    elif not edits_enabled:
+        st.caption("This deployment is read-only.")
     elif source == "Postgres":
         st.caption("Edits are off for the shared demo database.")
     if allow_writes:
