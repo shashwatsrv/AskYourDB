@@ -2,7 +2,9 @@
 
 Ask your database questions in plain English. AskYourDB turns a question into SQL, validates it, runs it, shows the results, and explains the query back to you.
 
-**Live demo:** https://askurdb.streamlit.app/ (read-only Northwind database, or bring your own Postgres / CSV / XLSX; edits are available on your own data only)
+**Live demos** (same code, two deployments):
+- **AskYourDB**, read-only: https://askurdb.streamlit.app/ (Northwind demo database, or bring your own Postgres / CSV / XLSX)
+- **MakeYourDB**, edits on your own data: https://makeurdb.streamlit.app/ (uploaded files or a connection string you paste; the shared demo database stays read-only)
 
 ---
 
@@ -15,6 +17,7 @@ Ask your database questions in plain English. AskYourDB turns a question into SQ
 - **Confidence score** and intent label shown with each answer
 - **Follow-up questions**: the last 10 messages are kept as context
 - **Cloud or local inference**: Groq (cloud) or Ollama (local)
+- **Download your data**: export uploaded tables, including any edits, as CSV (one Excel workbook when several files are loaded)
 
 ---
 
@@ -73,6 +76,8 @@ Edits are an opt-in mode (the **Enable edits** switch). Supported statements: `I
 
 **Where edits are allowed:** uploaded CSV / XLSX files (each visitor edits their own temporary copy) and a Postgres connection string you paste yourself (your database, your permissions). The shared demo database is never writable: the app does not offer the switch for it, and its role is `SELECT`-only.
 
+**How edits are switched on.** A deployment offers edits only when its secret `ENABLE_EDITS` is `"true"`; without it (the default) the app is read-only. The two live apps run the same code from the same branch and differ only in that secret.
+
 **Safety layers**
 
 1. **Allowlist guard.** Exactly one statement; only `SELECT` (and `INSERT` / `UPDATE` / `DELETE` when edits are on). Multi-statement input, data-modifying CTEs and `SELECT ... INTO` are rejected, and every table must exist.
@@ -83,7 +88,7 @@ Edits are an opt-in mode (the **Enable edits** switch). Supported statements: `I
 
 **Helping the model write valid changes.** In edit mode the schema sent to the model flags columns as required, auto-filled or generated. For a single-row `INSERT` with no ID given, the model may fill a required integer ID with the next value (`MAX(id) + 1`); for any other missing required value it asks you.
 
-**Testing.** The guard, preview and execution layer were covered by 76 sandbox test cases during development (not yet a committed test suite). Live checks were run on SQLite (uploaded files) and on Postgres 16 (local Docker and a Neon branch): committed `INSERT` / `UPDATE` / `DELETE`, plus rollbacks on foreign-key and duplicate-key violations, verified directly in the database.
+**Testing.** The guard, preview and execution layer were covered by 76 sandbox test cases during development (not yet a committed test suite). Live checks were run on SQLite (uploaded files, including on the deployed Streamlit app) and on Postgres 16 (local Docker and a Neon branch): committed `INSERT` / `UPDATE` / `DELETE`, plus rollbacks on foreign-key and duplicate-key violations, verified directly in the database.
 
 ---
 
@@ -129,7 +134,7 @@ The deployed app is deliberately lightweight so it runs on a free tier. The Fast
 - **The audit log is ephemeral on Streamlit Community Cloud** (it lives in the OS temp directory; set `ASKYOURDB_AUDIT_DB` to keep it elsewhere).
 - **No undo yet.** Before-images are stored, but there is no restore button.
 - **The model can misread a request.** The preview and confirmation are the control. The app does not check column names or `NOT NULL` itself; the database rejects bad writes and the transaction rolls back.
-- **Not tested:** several users editing the same data at once, and edits through the deployed Streamlit Cloud app.
+- **Not tested:** several users editing the same data at once.
 
 ---
 
@@ -151,6 +156,7 @@ Create `.streamlit/secrets.toml` (already git-ignored) so the app has defaults:
 DEMO_DB_URL = "postgresql://user:password@host:5432/dbname"
 LLM_API_KEY_GROQ = "your-groq-key"
 LLM_MODEL_GROQ = "openai/gpt-oss-120b"
+ENABLE_EDITS = "true"   # only to test edits locally; leave it out for a read-only app
 ```
 
 ```powershell
@@ -205,7 +211,7 @@ uvicorn app.main:app --reload
 
 **Done in v2:** `INSERT` / `UPDATE` / `DELETE` with preview, confirmation, transaction rollback and an audit log.
 
-**Next:** undo from the stored before-images, a persistent audit log with real authentication, OCR ingestion (images and scans into a queryable database), foreign-key-aware schema retrieval, and a column-existence check.
+**Next:** undo from the stored before-images, a persistent audit log with real authentication, foreign-key-aware schema retrieval, and a column-existence check.
 ---
 
 ## Author
