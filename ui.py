@@ -11,7 +11,8 @@ from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write
 MAX_FILES = 5
 MAX_MB = 10
 st.set_page_config(page_title="AskYourDB", layout="wide")
-st.title("AskYourDB")
+title_slot = st.empty()  # the final title is set after the sidebar, once we know if edits are on
+title_slot.title("AskYourDB")
 st.caption("Connect your Postgres database or upload a CSV/XLSX and query it in plain English")
 
 
@@ -218,6 +219,7 @@ with st.sidebar:
         st.session_state.history = []
         st.rerun()
 
+title_slot.title("MakeYourDB" if allow_writes else "AskYourDB")
 
 # --- Validate inputs ---
 if not db_url:
