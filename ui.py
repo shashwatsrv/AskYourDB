@@ -3,6 +3,7 @@ import uuid
 import os
 import pandas as pd
 import re
+import io
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from app.core import run_query, explain_sql, load_files_to_sqlite, execute_write, get_audit_log
@@ -50,6 +51,37 @@ def friendly_error(err) -> str:
     else:
         return msg or "Unknown error."
     return f"{head} {detail}".strip()
+
+@st.cache_data(show_spinner=False, max_entries=20, ttl=3600)
+def export_tables(db_url: str, tables: tuple, version: int):
+    """Current contents of the uploaded tables: CSV bytes per table, plus one Excel workbook if several."""
+    eng = create_engine(db_url)
+    csvs, frames = {}, {}
+    with eng.connect() as conn:
+        for t in tables:
+            df = pd.read_sql(text(f'SELECT * FROM "{t}"'), conn)
+            frames[t] = df
+            csvs[t] = df.to_csv(index=False).encode("utf-8-sig")  # BOM so Excel reads accents correctly
+    xlsx = None
+    if len(frames) > 1:
+        try:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+                used = set()
+                for t, df in frames.items():
+                    name = re.sub(r"[\[\]:*?/\\]", "_", t)[:31] or "sheet"
+                    base, i = name, 2
+                    while name.lower() in used:
+                        suffix = f"_{i}"
+                        name = base[:31 - len(suffix)] + suffix
+                        i += 1
+                    used.add(name.lower())
+                    df.to_excel(xw, sheet_name=name, index=False)
+            xlsx = buf.getvalue()
+        except ImportError:
+            xlsx = None  # Excel support not installed: CSV downloads still work
+    eng.dispose()
+    return csvs, xlsx
 
 # --- Session state ---
 if "session_id" not in st.session_state:
@@ -109,6 +141,17 @@ with st.sidebar:
             db_url = st.session_state.upload_db_url
             for t in st.session_state.upload_tables:
                 st.success(f"`{t['table']}` ({t['rows']} rows) from {t['source']}")
+            ver = st.session_state.get("data_version", 0)
+            names = tuple(t["table"] for t in st.session_state.upload_tables)
+            with st.expander("Download current data"):
+                csvs, xlsx = export_tables(db_url, names, ver)
+                for n in names:
+                    st.download_button(f"{n}.csv", csvs[n], file_name=f"{n}_edited.csv",
+                                       mime="text/csv", key=f"dl_{n}_{ver}")
+                if xlsx:
+                    st.download_button("All tables (.xlsx)", xlsx, file_name="data_edited.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       key=f"dl_all_{ver}")
     # Edits are only offered on the visitor's own data: uploaded files,
     # or a connection string they typed. Never the default demo database.
     can_edit = bool(db_url) and (source == "CSV / XLSX" or bool(user_db_url))
@@ -264,6 +307,7 @@ if pending:
             )
         st.session_state.pending = None
         if res["ok"]:
+            st.session_state.data_version = st.session_state.get("data_version", 0) + 1
             st.session_state.history.append({"role": "user", "content": pending["prompt"]})
             st.session_state.history.append({"role": "assistant", "content": pending["sql"]})
             msg = f"Committed: {res['rows_affected']} row(s) affected (audit #{res['audit_id']})."
